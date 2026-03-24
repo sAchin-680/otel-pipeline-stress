@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,7 @@ import (
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"gopkg.in/yaml.v3"
 )
 
 var workers int
@@ -29,11 +31,26 @@ var rate int
 var durationStr string
 var totalSpans int
 var cardinality int
+var configPath string
+var enableLogs bool
 
 var rootCmd = &cobra.Command{
 	Use:   "stress",
 	Short: "OTel pipeline stress tester",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// If a config file is provided, load and override flags where set
+		if configPath != "" {
+			if err := loadScenarioConfig(configPath); err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+		}
+		// If the user explicitly passed --enable-logs on the CLI, honor it (override YAML)
+		if cmd.Flags().Changed("enable-logs") {
+			if v, err := cmd.Flags().GetBool("enable-logs"); err == nil {
+				enableLogs = v
+			}
+		}
+
 		d, err := time.ParseDuration(durationStr)
 		if err != nil {
 			return fmt.Errorf("invalid duration: %w", err)
@@ -61,16 +78,19 @@ var rootCmd = &cobra.Command{
 			_ = mp.Shutdown(ctx)
 		}()
 
-		// init logs
-		lp, err := initLogger(cmd.Context())
-		if err != nil {
-			return fmt.Errorf("init logs: %w", err)
+		// init logs only if enabled
+		var lp *sdklog.LoggerProvider
+		if enableLogs {
+			lp, err = initLogger(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("init logs: %w", err)
+			}
+			defer func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = lp.Shutdown(ctx)
+			}()
 		}
-		defer func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = lp.Shutdown(ctx)
-		}()
 
 		runStress(totalSpans, workers, rate, d)
 		return nil
@@ -87,6 +107,42 @@ func init() {
 	rootCmd.Flags().StringVar(&durationStr, "duration", "10s", "how long to run (e.g. 30s,1m)")
 	rootCmd.Flags().IntVar(&totalSpans, "spans", 0, "total spans to emit (0 = use rate)")
 	rootCmd.Flags().IntVar(&cardinality, "cardinality", 100, "number of unique attribute label sets to generate")
+	rootCmd.Flags().StringVar(&configPath, "config", "", "scenario config file (YAML)")
+	rootCmd.Flags().BoolVar(&enableLogs, "enable-logs", false, "enable emitting logs to collector (default false)")
+}
+
+// scenarioConfig represents a subset of the YAML scenario file used to populate flags
+type scenarioConfig struct {
+	Workers     int      `yaml:"workers"`
+	Rate        int      `yaml:"rate"`
+	Duration    string   `yaml:"duration"`
+	Cardinality int      `yaml:"cardinality"`
+	Signals     []string `yaml:"signals"`
+}
+
+func loadScenarioConfig(path string) error {
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var sc scenarioConfig
+	if err := yaml.Unmarshal(b, &sc); err != nil {
+		return err
+	}
+	if sc.Workers > 0 {
+		workers = sc.Workers
+	}
+	if sc.Rate > 0 {
+		rate = sc.Rate
+	}
+	if sc.Duration != "" {
+		durationStr = sc.Duration
+	}
+	if sc.Cardinality > 0 {
+		cardinality = sc.Cardinality
+	}
+	// Do not auto-enable logs from scenario YAML. Use the CLI flag `--enable-logs`
+	return nil
 }
 
 func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
@@ -233,38 +289,40 @@ func runStress(totalSpans, workers, rate int, duration time.Duration) {
 				counter.Add(ctx, 1, metric.WithAttributes(attrsCombined...))
 				hist.Record(ctx, elapsed, metric.WithAttributes(attrsCombined...))
 
-				// emit a log for this span with sampled severity
-				rv := rand.Intn(100)
-				severity := "INFO"
-				if rv >= 70 && rv < 90 {
-					severity = "WARN"
-				} else if rv >= 90 {
-					severity = "ERROR"
+				// emit a log for this span with sampled severity if logs enabled
+				if enableLogs {
+					rv := rand.Intn(100)
+					severity := "INFO"
+					if rv >= 70 && rv < 90 {
+						severity = "WARN"
+					} else if rv >= 90 {
+						severity = "ERROR"
+					}
+					logger := logglobal.Logger("stressor")
+					var rec otellog.Record
+					rec.SetTimestamp(time.Now())
+					switch severity {
+					case "WARN":
+						rec.SetSeverity(otellog.SeverityWarn)
+						rec.SetSeverityText("WARN")
+					case "ERROR":
+						rec.SetSeverity(otellog.SeverityError)
+						rec.SetSeverityText("ERROR")
+					default:
+						rec.SetSeverity(otellog.SeverityInfo)
+						rec.SetSeverityText("INFO")
+					}
+					rec.SetBody(otellog.StringValue("emitted span"))
+					// add basic attributes: service + user_id if present
+					rec.AddAttributes(otellog.String("service", "stress-tester"))
+					if len(attrs) > 0 {
+						// attrs[0] is an attribute.KeyValue created via attribute.String
+						if attrs[0].Key == "user_id" {
+							rec.AddAttributes(otellog.String("user_id", attrs[0].Value.AsString()))
+						}
+					}
+					logger.Emit(ctx, rec)
 				}
-						logger := logglobal.Logger("stressor")
-						var rec otellog.Record
-						rec.SetTimestamp(time.Now())
-						switch severity {
-						case "WARN":
-							rec.SetSeverity(otellog.SeverityWarn)
-							rec.SetSeverityText("WARN")
-						case "ERROR":
-							rec.SetSeverity(otellog.SeverityError)
-							rec.SetSeverityText("ERROR")
-						default:
-							rec.SetSeverity(otellog.SeverityInfo)
-							rec.SetSeverityText("INFO")
-						}
-						rec.SetBody(otellog.StringValue("emitted span"))
-						// add basic attributes: service + user_id if present
-						rec.AddAttributes(otellog.String("service", "stress-tester"))
-						if len(attrs) > 0 {
-							// attrs[0] is an attribute.KeyValue created via attribute.String
-							if attrs[0].Key == "user_id" {
-								rec.AddAttributes(otellog.String("user_id", attrs[0].Value.AsString()))
-							}
-						}
-						logger.Emit(ctx, rec)
 
 				select {
 				case <-ctx.Done():
