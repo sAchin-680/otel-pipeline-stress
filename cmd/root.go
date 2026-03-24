@@ -8,12 +8,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	"math/rand"
+
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	otellog "go.opentelemetry.io/otel/log"
+	logglobal "go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/metric"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
@@ -53,6 +59,17 @@ var rootCmd = &cobra.Command{
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = mp.Shutdown(ctx)
+		}()
+
+		// init logs
+		lp, err := initLogger(cmd.Context())
+		if err != nil {
+			return fmt.Errorf("init logs: %w", err)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = lp.Shutdown(ctx)
 		}()
 
 		runStress(totalSpans, workers, rate, d)
@@ -100,6 +117,21 @@ func initMetrics(ctx context.Context) (*sdkmetric.MeterProvider, error) {
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	otel.SetMeterProvider(mp)
 	return mp, nil
+}
+
+func initLogger(ctx context.Context) (*sdklog.LoggerProvider, error) {
+	exp, err := otlploggrpc.New(ctx,
+		otlploggrpc.WithEndpoint("localhost:4317"),
+		otlploggrpc.WithInsecure(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	// create a batch processor and logger provider, then register globally
+	proc := sdklog.NewBatchProcessor(exp)
+	lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
+	logglobal.SetLoggerProvider(lp)
+	return lp, nil
 }
 
 // generateAttributeSets returns `cardinality` unique attribute sets.
@@ -200,6 +232,39 @@ func runStress(totalSpans, workers, rate int, duration time.Duration) {
 				// record metrics with attributes
 				counter.Add(ctx, 1, metric.WithAttributes(attrsCombined...))
 				hist.Record(ctx, elapsed, metric.WithAttributes(attrsCombined...))
+
+				// emit a log for this span with sampled severity
+				rv := rand.Intn(100)
+				severity := "INFO"
+				if rv >= 70 && rv < 90 {
+					severity = "WARN"
+				} else if rv >= 90 {
+					severity = "ERROR"
+				}
+						logger := logglobal.Logger("stressor")
+						var rec otellog.Record
+						rec.SetTimestamp(time.Now())
+						switch severity {
+						case "WARN":
+							rec.SetSeverity(otellog.SeverityWarn)
+							rec.SetSeverityText("WARN")
+						case "ERROR":
+							rec.SetSeverity(otellog.SeverityError)
+							rec.SetSeverityText("ERROR")
+						default:
+							rec.SetSeverity(otellog.SeverityInfo)
+							rec.SetSeverityText("INFO")
+						}
+						rec.SetBody(otellog.StringValue("emitted span"))
+						// add basic attributes: service + user_id if present
+						rec.AddAttributes(otellog.String("service", "stress-tester"))
+						if len(attrs) > 0 {
+							// attrs[0] is an attribute.KeyValue created via attribute.String
+							if attrs[0].Key == "user_id" {
+								rec.AddAttributes(otellog.String("user_id", attrs[0].Value.AsString()))
+							}
+						}
+						logger.Emit(ctx, rec)
 
 				select {
 				case <-ctx.Done():
