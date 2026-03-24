@@ -10,7 +10,11 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -37,6 +41,17 @@ var rootCmd = &cobra.Command{
             ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
             defer cancel()
             _ = tp.Shutdown(ctx)
+        }()
+
+        // init metrics
+        mp, err := initMetrics(cmd.Context())
+        if err != nil {
+            return fmt.Errorf("init metrics: %w", err)
+        }
+        defer func() {
+            ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+            defer cancel()
+            _ = mp.Shutdown(ctx)
         }()
 
         runStress(totalSpans, workers, rate, d)
@@ -69,6 +84,20 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
     )
     otel.SetTracerProvider(tp)
     return tp, nil
+}
+
+func initMetrics(ctx context.Context) (*sdkmetric.MeterProvider, error) {
+    exp, err := otlpmetricgrpc.New(ctx,
+        otlpmetricgrpc.WithEndpoint("localhost:4317"),
+        otlpmetricgrpc.WithInsecure(),
+    )
+    if err != nil {
+        return nil, err
+    }
+    reader := sdkmetric.NewPeriodicReader(exp)
+    mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+    otel.SetMeterProvider(mp)
+    return mp, nil
 }
 
 // runStress spawns `workers` goroutines and emits either `totalSpans` across
@@ -104,6 +133,12 @@ func runStress(totalSpans, workers, rate int, duration time.Duration) {
         interval = time.Second / time.Duration(rate)
     }
 
+    // create meter & instruments
+    meter := otel.Meter("stress-tester")
+    counter, _ := meter.Int64Counter("spans_sent_total")
+    hist, _ := meter.Float64Histogram("span_duration_seconds")
+    svcAttr := attribute.String("service", "stress-tester")
+
     tr := otel.Tracer("stressor")
 
     for i := 0; i < workers; i++ {
@@ -118,8 +153,13 @@ func runStress(totalSpans, workers, rate int, duration time.Duration) {
                     return
                 }
 
+                start := time.Now()
                 _, span := tr.Start(ctx, "stress.span")
                 span.End()
+                elapsed := time.Since(start).Seconds()
+                // record metrics
+                counter.Add(ctx, 1, metric.WithAttributes(svcAttr))
+                hist.Record(ctx, elapsed, metric.WithAttributes(svcAttr))
                 atomic.AddInt64(&sent, 1)
 
                 select {
