@@ -1,0 +1,6 @@
+# High-cardinality scenario (as requested)
+workers: 10
+rate: 1000
+duration: 60s
+cardinality: 50000
+signals: [spans, metrics, logs]

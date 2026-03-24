@@ -1,0 +1,6 @@
+# Baseline scenario: moderate load, 1k spans/sec total
+workers: 10
+rate: 100
+duration: 60s
+cardinality: 100
+signals: [spans]
